@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+set -eo pipefail
+
+rm -rf classes
+mkdir classes
+clojure -e "(compile 'lambdametafactory-graal.main)"
+
+java -cp $(clojure -Spath):classes lambdametafactory_graal.main
+
+if [ -z "$GRAALVM_HOME" ]; then
+    echo 'Please set $GRAALVM_HOME'
+    exit 1
+fi
+
+$GRAALVM_HOME/bin/native-image \
+    -cp $(clojure -Spath):classes \
+    -H:Name=lambdametafactory \
+    -H:+ReportExceptionStackTraces \
+    --initialize-at-build-time  \
+    --verbose \
+    --no-fallback \
+    --no-server \
+    "-J-Xmx3g" \
+    lambdametafactory_graal.main

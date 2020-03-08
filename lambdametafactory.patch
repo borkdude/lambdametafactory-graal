@@ -1,0 +1,313 @@
+From f84531c3623a34912c6dc1b45b4a789b55f53bcc Mon Sep 17 00:00:00 2001
+From: Ghadi Shayban <ghadi@cognitect.com>
+Date: Sun, 8 Mar 2020 13:47:16 -0400
+Subject: [PATCH 1/2] lambdametafactory
+
+---
+ src/jvm/clojure/lang/Compiler.java          |  19 ++-
+ src/jvm/clojure/lang/LambdaMetafactory.java | 169 ++++++++++++++++++++
+ 2 files changed, 187 insertions(+), 1 deletion(-)
+ create mode 100644 src/jvm/clojure/lang/LambdaMetafactory.java
+
+diff --git a/src/jvm/clojure/lang/Compiler.java b/src/jvm/clojure/lang/Compiler.java
+index abac2251..f49e5972 100644
+--- a/src/jvm/clojure/lang/Compiler.java
++++ b/src/jvm/clojure/lang/Compiler.java
+@@ -1427,41 +1427,58 @@ static abstract class MethodExpr extends HostExpr{
+ 					if(RT.booleanCast(RT.UNCHECKED_MATH.deref()))
+ 						gen.invokeStatic(RT_TYPE, Method.getMethod("int uncheckedIntCast(long)"));
+ 					else
+ 						gen.invokeStatic(RT_TYPE, Method.getMethod("int intCast(long)"));
+ 					}
+ 				else if(primc == float.class && parameterTypes[i] == double.class)
+ 					{
+ 					final MaybePrimitiveExpr pe = (MaybePrimitiveExpr) e;
+ 					pe.emitUnboxed(C.EXPRESSION, objx, gen);
+ 					gen.visitInsn(F2D);
+ 					}
+ 				else if(primc == double.class && parameterTypes[i] == float.class)
+ 					{
+ 					final MaybePrimitiveExpr pe = (MaybePrimitiveExpr) e;
+ 					pe.emitUnboxed(C.EXPRESSION, objx, gen);
+ 					gen.visitInsn(D2F);
+ 					}
+ 				else
+ 					{
+ 					e.emit(C.EXPRESSION, objx, gen);
+-					HostExpr.emitUnboxArg(objx, gen, parameterTypes[i]);
++					// magic SAM cast here
++					if (LambdaMetafactory.isSAM(parameterTypes[i])) {
++
++						IPersistentVector nb = LambdaMetafactory.prepare(parameterTypes[i]);
++						String internalName = (String) nb.nth(0);
++						byte[] bytecode = (byte[]) nb.nth(1);
++						if (RT.booleanCast(COMPILE_FILES.deref()))
++							writeClassFile(internalName, bytecode);
++						if (RT.loadClassForName(internalName.replace("/", ".")) == null) {
++                                                    //System.err.println("defining: " + internalName.replace("/", "."));
++							DynamicClassLoader loader = (DynamicClassLoader) LOADER.deref();
++							loader.defineClass(internalName.replace("/", "."), bytecode, null);
++						}
++						gen.visitMethodInsn(INVOKESTATIC, internalName, "convert",
++								"(Ljava/lang/Object;)L"+parameterTypes[i].getName().replace(".", "/")+";"
++								, false);
++						} else
++							HostExpr.emitUnboxArg(objx, gen, parameterTypes[i]);
+ 					}
+ 				}
+ 			catch(Exception e1)
+ 				{
+                 throw Util.sneakyThrow(e1);
+ 				}
+ 
+ 			}
+ 	}
+ }
+ 
+ static class InstanceMethodExpr extends MethodExpr{
+ 	public final Expr target;
+ 	public final String methodName;
+ 	public final IPersistentVector args;
+ 	public final String source;
+ 	public final int line;
+ 	public final int column;
+ 	public final Symbol tag;
+ 	public final boolean tailPosition;
+diff --git a/src/jvm/clojure/lang/LambdaMetafactory.java b/src/jvm/clojure/lang/LambdaMetafactory.java
+new file mode 100644
+index 00000000..74e4398b
+--- /dev/null
++++ b/src/jvm/clojure/lang/LambdaMetafactory.java
+@@ -0,0 +1,169 @@
++package clojure.lang;
++
++import clojure.asm.*;
++import clojure.asm.commons.GeneratorAdapter;
++
++import java.io.FileOutputStream;
++import java.lang.invoke.MethodType;
++import java.lang.reflect.Method;
++import java.lang.reflect.Modifier;
++import java.util.Arrays;
++
++import static clojure.asm.Opcodes.*;
++
++public class LambdaMetafactory {
++
++    static byte[] generateClass(Class intf, String internalName) {
++        ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_MAXS + ClassWriter.COMPUTE_FRAMES);
++        cw.visit(V1_8, ACC_PUBLIC + ACC_SUPER + ACC_SYNTHETIC, internalName, null, "java/lang/Object", new String[]{intf.getName().replace(".", "/")});
++        cw.visitField(ACC_PRIVATE + ACC_FINAL,
++                "delegate", "Lclojure/lang/IFn;", null, null);
++        generateConstructor(cw, internalName);
++        generateStaticFactory(cw, internalName, intf);
++        generateForwarder(cw, internalName, intf);
++        cw.visitEnd();
++        return cw.toByteArray();
++    }
++
++    static void generateConstructor(ClassWriter cw, String internalName) {
++        MethodVisitor ctor = cw.visitMethod(ACC_PRIVATE, "<init>",
++                "(Lclojure/lang/IFn;)V", null, null);
++        ctor.visitCode();
++        ctor.visitVarInsn(ALOAD, 0);
++        ctor.visitMethodInsn(INVOKESPECIAL, "java/lang/Object", "<init>",
++                Type.getMethodDescriptor(Type.VOID_TYPE), false);
++        ctor.visitVarInsn(ALOAD, 0);
++        ctor.visitVarInsn(ALOAD, 1);
++        ctor.visitFieldInsn(PUTFIELD, internalName, "delegate", "Lclojure/lang/IFn;");
++        ctor.visitInsn(RETURN);
++        ctor.visitMaxs(-1,-1);
++        ctor.visitEnd();
++    }
++
++    static void generateStaticFactory(ClassWriter cw, String internalName, Class intf) {
++        String desc = "(Ljava/lang/Object;)L"+intf.getName().replace(".", "/")+";";
++        MethodVisitor factory = cw.visitMethod(ACC_PUBLIC + ACC_STATIC, "convert",
++                desc, null, null);
++        GeneratorAdapter gen = new GeneratorAdapter(factory, ACC_PUBLIC + ACC_STATIC, "convert", desc);
++        gen.visitCode();
++        Label nullLabel = new Label();
++        Label castLabel = new Label();
++        gen.loadArg(0);
++        gen.ifNull(nullLabel);
++        gen.loadArg(0);
++        gen.instanceOf(Type.getType(intf));
++        gen.ifZCmp(IFEQ, castLabel);
++
++        gen.loadArg(0);
++        gen.checkCast(Type.getType(intf));
++        gen.returnValue();
++
++        gen.mark(castLabel);
++        gen.visitTypeInsn(NEW, internalName);
++        gen.visitInsn(DUP);
++        gen.visitVarInsn(ALOAD, 0);
++        gen.checkCast(Type.getType("Lclojure/lang/IFn;"));
++        gen.visitMethodInsn(INVOKESPECIAL, internalName, "<init>", "(Lclojure/lang/IFn;)V", false);
++        gen.visitInsn(ARETURN);
++
++        gen.mark(nullLabel);
++        gen.visitInsn(ACONST_NULL);
++        gen.returnValue();
++        gen.visitMaxs(-1,-1); // why is this necessary?
++        gen.visitEnd();
++    }
++
++    static void generateForwarder(ClassWriter cw, String internalName, Class intf) {
++        Method m = samMethod(intf);
++        Class retc = m.getReturnType();
++        Class[] ptypes = m.getParameterTypes();
++        // throw if > 20 params
++        GeneratorAdapter gen = new GeneratorAdapter(ACC_PUBLIC, clojure.asm.commons.Method.getMethod(m), null, null, cw);
++
++        gen.loadThis();
++        gen.visitFieldInsn(GETFIELD, internalName, "delegate", "Lclojure/lang/IFn;");
++        for (int i = 0; i < m.getParameterCount(); i ++) {
++            gen.loadArg(i);
++            if (ptypes[i].isPrimitive()) {
++                boxPrimitive(gen, ptypes[i]);
++            } else { // clear references
++                gen.visitInsn(ACONST_NULL);
++                gen.storeArg(i);
++            }
++        }
++        gen.visitMethodInsn(INVOKEINTERFACE,
++                "clojure/lang/IFn",
++                "invoke",
++                MethodType.genericMethodType(m.getParameterCount()).toMethodDescriptorString() ,
++                true);
++
++        if (retc.equals(Void.TYPE)) {
++            gen.pop();
++        } else if (retc.isPrimitive()) {
++            gen.unbox(Type.getType(retc));
++        } else {
++            gen.checkCast(Type.getType(retc));
++        }
++        gen.returnValue();
++        gen.endMethod();
++    }
++
++    // TODO finish boxing
++    static void boxPrimitive(GeneratorAdapter gen, Class primc) {
++        if (primc == boolean.class) {
++            gen.visitMethodInsn(INVOKESTATIC, "java/lang/Boolean", "valueOf",
++                    "(Z)Ljava/lang/Boolean;", false);
++        } else if (primc == char.class) {
++
++        } else if (primc == int.class) {
++            gen.visitMethodInsn(INVOKESTATIC, "java/lang/Integer", "valueOf",
++                    "(I)Ljava/lang/Integer;", false);
++        } else if (primc == float.class) {
++
++        } else if (primc == double.class) {
++
++        } else if (primc == long.class) {
++            gen.visitMethodInsn(INVOKESTATIC, "java/lang/Long", "valueOf",
++                    "(J)Ljava/lang/Long;", false);
++        } else if (primc == byte.class) {
++
++        } else if (primc == short.class) {
++
++        }
++    }
++
++    static Method samMethod(Class intf) {
++        // TODO Correct for interfaces like Comparable that redeclare Object methods
++        return Arrays.stream(intf.getMethods())
++                .filter(m -> Modifier.isAbstract(m.getModifiers()))
++                .findFirst()
++                .get();
++    }
++
++    static boolean isSAM(Class target) {
++        if (!target.isInterface())
++            return false;
++        if (Arrays.stream(target.getMethods()).filter(m -> Modifier.isAbstract(m.getModifiers())).count() == 1)
++            return true;
++        return false;
++    }
++
++    private static String factoryName(Class intf) {
++        return String.format("%s.LambdaFactory$%s", RT.CURRENT_NS.deref(), intf.getName().replace(".", "$"))
++                .replace(".", "/");
++    }
++
++    static IPersistentVector prepare(Class intf) {
++        String internalName = factoryName(intf);
++        return Tuple.create(internalName, generateClass(intf, internalName));
++    }
++
++    //public static void main(String[] args) {
++    //    byte[] bs = generateClass(java.util.function.Supplier.class, "clojure/lang/GhadiTest");
++    //    try (FileOutputStream f = new FileOutputStream("target/classes/clojure/lang/GhadiTest.class")) {
++    //        f.write(bs);
++    //    } catch (Exception e) {
++    //        e.printStackTrace();
++    //    }
++    //}
++}
+-- 
+2.25.0
+
+
+From 15583b10702ca0faeae91567dd7b6e7766bca471 Mon Sep 17 00:00:00 2001
+From: Ghadi Shayban <ghadi@cognitect.com>
+Date: Sun, 8 Mar 2020 14:37:54 -0400
+Subject: [PATCH 2/2] fix method inference
+
+---
+ src/jvm/clojure/lang/Reflector.java | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/jvm/clojure/lang/Reflector.java b/src/jvm/clojure/lang/Reflector.java
+index d5811cc5..6d8451a5 100644
+--- a/src/jvm/clojure/lang/Reflector.java
++++ b/src/jvm/clojure/lang/Reflector.java
+@@ -575,40 +575,42 @@ static Object boxArg(Class paramType, Object arg){
+ }
+ 
+ static Object[] boxArgs(Class[] params, Object[] args){
+ 	if(params.length == 0)
+ 		return null;
+ 	Object[] ret = new Object[params.length];
+ 	for(int i = 0; i < params.length; i++)
+ 		{
+ 		Object arg = args[i];
+ 		Class paramType = params[i];
+ 		ret[i] = boxArg(paramType, arg);
+ 		}
+ 	return ret;
+ }
+ 
+ static public boolean paramArgTypeMatch(Class paramType, Class argType){
+ 	if(argType == null)
+ 		return !paramType.isPrimitive();
+ 	if(paramType == argType || paramType.isAssignableFrom(argType))
+ 		return true;
++	if(IFn.class.isAssignableFrom(argType) && LambdaMetafactory.isSAM(paramType))
++		return true;
+ 	if(paramType == int.class)
+ 		return argType == Integer.class
+ 		       || argType == long.class
+ 				|| argType == Long.class
+ 				|| argType == short.class
+ 				|| argType == byte.class;// || argType == FixNum.class;
+ 	else if(paramType == float.class)
+ 		return argType == Float.class
+ 				|| argType == double.class;
+ 	else if(paramType == double.class)
+ 		return argType == Double.class
+ 				|| argType == float.class;// || argType == DoubleNum.class;
+ 	else if(paramType == long.class)
+ 		return argType == Long.class
+ 				|| argType == int.class
+ 				|| argType == short.class
+ 				|| argType == byte.class;// || argType == BigNum.class;
+ 	else if(paramType == char.class)
+ 		return argType == Character.class;
+ 	else if(paramType == short.class)
+-- 
+2.25.0
+
